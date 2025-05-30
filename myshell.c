@@ -63,6 +63,11 @@ int main()
 					printf("%s\n", cwd);
 				}
 			}
+			else if (strcmp(line->commands[0].argv[0], "exit") == 0)
+			{
+				printf("Saliendo de msh...\n");
+				exit(0);
+			}
 			else
 			{
 				// Comprobar existencia del comando
