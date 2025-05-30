@@ -47,6 +47,21 @@ int main()
 			// Comprobar que es cd
 			if (strcmp(line->commands[0].argv[0], "cd") == 0)
 			{
+				char cwd[1024];
+				if (line->commands[0].argc > 1)
+				{
+					chdir(line->commands[0].argv[1]);
+					getcwd(cwd, sizeof(cwd));
+					printf("%s\n", cwd);
+				}
+				else
+				{
+					// Reedirigir a HOME
+					const char *home = getenv("HOME");
+					chdir(home);
+					getcwd(cwd, sizeof(cwd));
+					printf("%s\n", cwd);
+				}
 			}
 			else
 			{
