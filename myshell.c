@@ -254,7 +254,14 @@ int main()
 						else
 						{
 							int status;
-							waitpid(pid, &status, 0);
+							if (line->background)
+							{
+								printf("[%d]\n", pid);
+							}
+							else
+							{
+								waitpid(pid, &status, 0);
+							}
 						}
 					}
 				}
