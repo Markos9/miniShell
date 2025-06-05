@@ -7,9 +7,143 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 char buf[1024];
 tline *line;
+char *Commands[5] = {"cd", "jobs", "bg", "umask", "exit"};
+
+typedef enum { RUNNING, STOPPED } job_status;
+
+typedef struct {
+    int job_id;         
+    pid_t pgid;          
+    char *cmdline;       
+    job_status status;   
+} job_t;
+
+int job_capacity = 10;
+job_t *job_list = NULL;
+int job_count = 0;
+
+
+void add_job(pid_t pgid, const char *cmdline, job_status status) {
+    if (job_count == job_capacity) {
+		if (job_capacity == 0) {
+			job_capacity = 4;
+		} else {
+			job_capacity = job_capacity * 2;
+		}
+
+        job_list = realloc(job_list, job_capacity * sizeof(job_t));
+        if (!job_list) {
+            perror("realloc");
+            exit(1);
+        }
+    }
+
+    job_list[job_count].job_id = job_count + 1;
+    job_list[job_count].pgid = pgid;
+    job_list[job_count].cmdline = strdup(cmdline); // copiar línea
+    job_list[job_count].status = status;
+    job_count++;
+}
+
+void cmd_jobs() {
+    for (int i = 0; i < job_count; i++) {
+        if (job_list[i].status == RUNNING || job_list[i].status == STOPPED) {
+            const char *status_str;
+
+            if (job_list[i].status == RUNNING) {
+                status_str = "Running";
+            } else {
+                status_str = "Stopped";
+            }
+
+            printf("[%d]  %s\t%s\n",
+                   job_list[i].job_id,
+                   status_str,
+                   job_list[i].cmdline);
+        }
+    }
+}
+
+void clean_finished_jobs() {
+    int i = 0;
+
+    while (i < job_count) {
+        pid_t result = waitpid(job_list[i].pgid, NULL, WNOHANG);
+
+        if (result > 0) {
+            // Liberar memoria de la línea de comando
+            free(job_list[i].cmdline);
+
+            // Mover el último trabajo a esta posición para compactar
+            job_list[i] = job_list[job_count - 1];
+            job_count--;
+        } else {
+            i++; // solo avanzar si no eliminaste el trabajo
+        }
+    }
+}
+
+int string_in_list(const char *str) {
+    for (int i = 0; i < 5; i++) {
+        if (strcmp(str, Commands[i]) == 0) {
+            return 1;  // Encontrado
+        }
+    }
+    return 0;  // No encontrado
+}
+
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+void cmd_bg(int job_id) {
+    job_t *job_to_resume = NULL;
+
+    if (job_id == 0) {
+        // Buscar el último job detenido
+        for (int i = job_count - 1; i >= 0; i--) {
+            if (job_list[i].status == STOPPED) {
+                job_to_resume = &job_list[i];
+                break;
+            }
+        }
+        if (!job_to_resume) {
+            return;
+        }
+    } else {
+        // Buscar job por job_id
+        for (int i = 0; i < job_count; i++) {
+            if (job_list[i].job_id == job_id) {
+                job_to_resume = &job_list[i];
+                break;
+            }
+        }
+        if (!job_to_resume) {
+            return;
+        }
+        if (job_to_resume->status != STOPPED) {
+            return;
+        }
+    }
+
+    // Enviar señal SIGCONT para reanudar
+    if (kill(job_to_resume->pgid, SIGCONT) < 0) {
+        perror("kill (SIGCONT)");
+        return;
+    }
+
+    // Cambiar estado a RUNNING
+    job_to_resume->status = RUNNING;
+
+    printf("[%d] %s &\n", job_to_resume->job_id, job_to_resume->cmdline);
+}
+
+
 
 void sigint_handler(int sig)
 {
@@ -45,6 +179,30 @@ int command_exists(const char *cmd)
 	free(path_dup);
 	// No existe
 	return 0;
+}
+
+void cmd_umask(tline *line){
+	if (line->commands[0].argc > 1) {
+		char *arg = line->commands[0].argv[1];
+		char *endptr;
+		mode_t mask = strtol(arg, &endptr, 8);
+
+		if (*endptr != '\0') {
+			fprintf(stderr, "umask: argumento no válido\n");
+			return;
+		}
+
+		if (mask > 0777) {
+			fprintf(stderr, "umask: valor fuera de rango\n");
+			return;
+		}
+
+		umask(mask);
+	} else {
+		mode_t mask = umask(0);
+		printf("%04o\n", mask);
+		umask(mask);
+	}
 }
 
 void pipe_commands(tline *line)
@@ -143,10 +301,17 @@ void pipe_commands(tline *line)
 			{
 				dup2(pipes[i][1], STDOUT_FILENO);
 			}
+
 			for (int j = 0; j < n - 1; j++)
 			{
 				close(pipes[j][0]);
 				close(pipes[j][1]);
+			}
+
+			// Comprobar si el comando está en la lista de comandos prohibidos
+			if (string_in_list(line->commands[i].argv[0]) == 1)
+			{
+				exit(EXIT_FAILURE);
 			}
 			execvp(line->commands[i].argv[0], line->commands[i].argv);
 			perror("execvp");
@@ -164,26 +329,29 @@ void pipe_commands(tline *line)
 		}
 	}
 
+	// Cerrar los pipes en el padre
 	for (i = 0; i < n - 1; i++)
 	{
 		close(pipes[i][0]);
 		close(pipes[i][1]);
 	}
 
-	if (!line->background)
-	{
-		tcsetpgrp(STDIN_FILENO, pgid);
-		for (i = 0; i < n; i++)
-		{
-			wait(NULL);
+	if (line->background) {
+		// Comando en segundo plano
+		add_job(pgid, line->commands[0].argv[0], RUNNING);  // solo primer comando si es 1
+		printf("[%d]\n", pgid);
+	} else {
+		//Foreground command
+		int status;
+		waitpid(pgid, &status, WUNTRACED);
+
+		if (WIFSTOPPED(status)) {
+			printf("\n[%d]+  Stopped\t%s\n", job_count + 1, line->commands[0].argv[0]);
+			add_job(pgid, line->commands[0].argv[0], STOPPED);
+		} else {
+			// Foreground terminado 
+			tcsetpgrp(STDIN_FILENO, getpid()); // Recuperar control del terminal
 		}
-		// Recuperar control de la terminal
-		tcsetpgrp(STDIN_FILENO, getpid());
-	}
-	else
-	{
-		// En background, no esperamos y no cambiamos control terminal
-		printf("[%d]\n", pgid); // Mostrar grupo de procesos para info usuario
 	}
 }
 
@@ -193,6 +361,8 @@ int main()
 	signal(SIGINT, sigint_handler);
 	signal(SIGTSTP, sigtstp_handler);
 	signal(SIGTTOU, SIG_IGN);
+
+	job_list = malloc(job_capacity * sizeof(job_t));
 
 	printf("msh> ");
 	while (fgets(buf, sizeof(buf), stdin) != NULL)
@@ -224,9 +394,30 @@ int main()
 			// Comando exit
 			else if (strcmp(line->commands[0].argv[0], "exit") == 0)
 			{
+				free(job_list);
 				printf("Saliendo de msh...\n");
 				exit(0);
+			// Comando jobs
+			} else if (strcmp(line->commands[0].argv[0], "jobs") == 0)
+			{
+				clean_finished_jobs();
+				cmd_jobs();
+			//Comando bg
+			} else if (strcmp(line->commands[0].argv[0], "bg") == 0){
+				clean_finished_jobs();
+
+				if (line->commands[0].argc > 1){
+					cmd_bg(atoi(line->commands[0].argv[1]));
+				} else {
+					// Si no se especifica un job_id, reanudar el último detenido
+					cmd_bg(0);
+				}
+
+			}else if (strcmp(line->commands[0].argv[0], "umask") == 0)
+			{
+				cmd_umask(line);
 			}
+
 			// Resto de comandos
 			else
 			{
@@ -319,11 +510,15 @@ int main()
 							int status;
 							if (line->background)
 							{
+								add_job(pid, line->commands[0].argv[0], RUNNING);
 								printf("[%d]\n", pid);
 							}
 							else
 							{
 								waitpid(pid, &status, WUNTRACED);
+								if (WIFSTOPPED(status)) {
+									add_job(pid, line->commands[0].argv[0], STOPPED);
+								}
 								// recuperar control de terminal
 								tcsetpgrp(STDIN_FILENO, getpid());
 							}
